@@ -2,22 +2,62 @@ import socket
 import threading
 import os
 import time
-from Config import *
-from Utils import *
+import struct
+import zlib
+import random
+from collections import deque
 
+# --- CONFIGURAÇÕES E UTILS INTEGRADOS ---
+IP_SERVIDOR = '192.168.1.100' # Alterado para localhost para facilitar testes
+PORTA_SERVIDOR = 5000
+TAMANHO_PAYLOAD = 1024
+TIMEOUT_REDE = 5.0
+FORMATO_HEADER = '!BIIH'
+TAMANHO_HEADER = struct.calcsize(FORMATO_HEADER)
+CHANCE_CORRUPCAO = 0.05  # 5% de chance de erro
+
+REQ, ACK, ERRO, DADO, FIM = 0, 1, 2, 3, 4
+
+def criar_pacote(tipo, seq, dados=b""):
+    checksum = zlib.crc32(dados)
+    header = struct.pack(FORMATO_HEADER, tipo, seq, checksum, len(dados))
+    return header + dados
+
+def desempacotar_pacote(pacote):
+    header_bruto = pacote[:TAMANHO_HEADER]
+    payload = pacote[TAMANHO_HEADER:]
+    tipo, seq, checksum, tamanho = struct.unpack(FORMATO_HEADER, header_bruto)
+    return tipo, seq, checksum, tamanho, payload
+
+# --- CLASSE DO SERVIDOR ---
 class ServidorUDP:
     def __init__(self):
-        # 1. Configurações Iniciais
         self.host = IP_SERVIDOR
         self.port = PORTA_SERVIDOR
+        self.base_dir = "Servidor-data"
+
+        self.transferencias_ativas = {} # Dicionário: { (ip, porta): (Event, ultimo_ack) }
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        self.ack_event = threading.Event()
+        self.ultimo_ack_recebido = -1
+        self.running = True
+
+        self.tamanho_janela = 5
+        self.janela = deque()
+        self.proxima_seq_leitura = 0
+        self.ack_event = threading.Event()
+        self.ultimo_ack_recebido = -1
+        
+        # Garante que a pasta de dados do servidor existe
+        if not os.path.exists(self.base_dir):
+            os.makedirs(self.base_dir)
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.host, self.port))
-        
-        # Controle de estado (futuramente útil para múltiplas conexões)
         self.running = True
 
     def iniciar(self):
-        """Inicia a thread de escuta e o loop principal."""
         self.listener_thread = threading.Thread(target=self._escutar, daemon=True)
         self.listener_thread.start()
         print(f"[*] Servidor iniciado em {self.host}:{self.port}")
@@ -26,18 +66,14 @@ class ServidorUDP:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
-            print("\n[!] Desligando servidor...")
             self.running = False
 
     def _escutar(self):
-        """Método interno que roda na thread de escuta."""
         while self.running:
             try:
                 pacote, addr = self.sock.recvfrom(TAMANHO_PAYLOAD + TAMANHO_HEADER)
                 self._processar_pacote(pacote, addr)
-            except Exception as e:
-                if self.running:
-                    print(f"[!] Erro no listener: {e}")
+            except:
                 break
 
     def _processar_pacote(self, pacote, addr):
@@ -46,59 +82,89 @@ class ServidorUDP:
         if tipo == REQ:
             self._processar_requisicao(payload, addr)
         elif tipo == ACK:
-            print(f"[ACK] Recebido de {addr} para seq {seq}")
-            # Aqui você vai disparar um evento para o Stop-and-Wait futuramente
-        elif tipo == ERRO:
-            print(f"[ERRO] Recebido de {addr}")
-        else:
-            print(f"[?] Tipo desconhecido ({tipo}) recebido de {addr}")
+            if addr in self.transferencias_ativas:
+                event, ack_ref = self.transferencias_ativas[addr]
+                ack_ref[0] = seq # Atualiza o valor do ACK na lista mutável
+                event.set() # Acorda a thread específica desse cliente
 
     def _processar_requisicao(self, payload, addr):
         nome_arquivo = payload.decode()
-        path = os.path.join("Data", nome_arquivo)
-        
-        print(f"[REQ] Arquivo: {nome_arquivo} pedido por {addr}")
+        path = os.path.join(self.base_dir, nome_arquivo)
         
         if os.path.exists(path):
-            # Handshake de confirmação
-            confirmacao = criar_pacote(ACK, 0, "OK".encode())
-            self.sock.sendto(confirmacao, addr)
-            
-            # Dispara o envio em uma thread separada para não travar o servidor
+            # Criamos uma thread e passamos o ADDR. 
+            # NÃO usamos variáveis de self. lá dentro para controle de envio.
             threading.Thread(target=self._enviar_arquivo, args=(addr, path), daemon=True).start()
         else:
             erro = criar_pacote(ERRO, 0, "Arquivo nao encontrado".encode())
             self.sock.sendto(erro, addr)
 
     def _enviar_arquivo(self, addr, path):
-        print(f"[SEND] Iniciando envio: {path}")
+        # --- VARIÁVEIS LOCAIS (ISOLADAS POR THREAD) ---
+        janela_local = deque()
+        proxima_seq_leitura = 0
+        ultimo_ack_recebido = [-1] # Usamos uma lista para ser mutável dentro de outra thread
+        ack_event_local = threading.Event()
+
+        # Precisamos de uma forma de o listener avisar ESTA thread que o ACK chegou
+        # Vamos registrar este cliente em um dicionário global temporário
+        self.transferencias_ativas[addr] = (ack_event_local, ultimo_ack_recebido)
+
+        print(f"[GBN] Iniciando envio para {addr} | Arquivo: {os.path.basename(path)}")
         
         try:
             with open(path, "rb") as f:
-                seq = 0
-                while True:
+                # Carga inicial
+                while len(janela_local) < self.tamanho_janela:
                     dados = f.read(TAMANHO_PAYLOAD)
-                    if not dados:
+                    if not dados: break
+                    janela_local.append(criar_pacote(DADO, proxima_seq_leitura, dados))
+                    proxima_seq_leitura += 1
+
+                while janela_local:
+                    for pacote in janela_local:
+                        _, s, _, _, _ = desempacotar_pacote(pacote)
+                        envio = pacote
+                        if random.random() < CHANCE_CORRUPCAO:
+                            print(f"[!] Corrompendo propositalmente seq {s}")
+                            envio = self._corromper_pacote(pacote)
+                        print(f"[SEND] Segmento {s} enviado")
+                        self.sock.sendto(envio, addr)
+
+                    ack_event_local.clear()
+                    if ack_event_local.wait(timeout=0.2):
+                        while janela_local:
+                            _, s_base, _, _, _ = desempacotar_pacote(janela_local[0])
+                            if s_base < ultimo_ack_recebido[0]:
+                                confirmado = janela_local.popleft()
+                                _, s_conf, _, _, _ = desempacotar_pacote(confirmado)
+                                print(f"[OK] Segmento {s_conf} confirmado. Deslizando...")
+
+                                novos_dados = f.read(TAMANHO_PAYLOAD)
+                                if novos_dados:
+                                    janela_local.append(criar_pacote(DADO, proxima_seq_leitura, novos_dados))
+                                    proxima_seq_leitura += 1
+                            else:
+                                print(f"[NACK] O cliente pediu o reenvio do segmento {desempacotar_pacote(janela_local[0])[1]}. Voltando N...")
+                                break
+                    else:
+                        print(f"[TIMEOUT] Estourou na base {desempacotar_pacote(janela_local[0])[1]}. Voltando N...")
                         break
-                    
-                    pacote = criar_pacote(DADO, seq, dados)
-                    self.sock.sendto(pacote, addr)
-                    print(f"[SEND] Enviado segmento {seq}")
-                    
-                    # --- AQUI ENTRARÁ O STOP-AND-WAIT ---
-                    # Por enquanto, apenas um pequeno delay
-                    time.sleep(0.01)
-                    seq += 1
+                
+                self.sock.sendto(criar_pacote(FIM, 0, b""), addr)
+        finally:
+            # Limpa o registro ao terminar
+            del self.transferencias_ativas[addr]
 
-            # Envia FIM
-            pacote_fim = criar_pacote(FIM, 0, b"")
-            self.sock.sendto(pacote_fim, addr)
-            print(f"[DONE] Envio de {path} concluído.")
-            
-        except Exception as e:
-            print(f"[!] Erro ao enviar arquivo: {e}")
+    def _corromper_pacote(self, pacote):
+        """Altera um byte aleatório no payload para simular erro de rede."""
+        lista_bytes = list(pacote)
+        # Escolhe um índice aleatório dentro do payload (após o header)
+        if len(lista_bytes) > TAMANHO_HEADER:
+            indice = random.randint(TAMANHO_HEADER, len(lista_bytes) - 1)
+            # Inverte o byte ou muda para um valor fixo
+            lista_bytes[indice] = (lista_bytes[indice] + 1) % 256
+        return bytes(lista_bytes)
 
-# --- Execução ---
 if __name__ == "__main__":
-    servidor = ServidorUDP()
-    servidor.iniciar()
+    ServidorUDP().iniciar()
