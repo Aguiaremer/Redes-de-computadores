@@ -10,10 +10,10 @@ from collections import deque
 # --- CONFIGURAÇÕES ---
 IP_SERVIDOR = '192.168.1.100'
 PORTA_SERVIDOR = 5000
-TAMANHO_PAYLOAD = 1024
+TAMANHO_PAYLOAD = 1400
 FORMATO_HEADER = '!BIIH'
 TAMANHO_HEADER = struct.calcsize(FORMATO_HEADER)
-CHANCE_CORRUPCAO = 0.001
+CHANCE_CORRUPCAO = 0.01
 
 # Tipos de Pacotes
 REQ, ACK, ERRO, DADO, FIM, SYN, SYN_ACK = 0, 1, 2, 3, 4, 5, 6
@@ -43,7 +43,7 @@ class ServidorUDP:
 
     def iniciar(self):
         print(f"[*] SERVIDOR ONLINE EM {PORTA_SERVIDOR}")
-        print(f"[*] AGUARDANDO CONEXOES... (Ctrl+C para encerrar)")
+        print(f"[*] AGUARDANDO CONEXOES...")
         print("-" * 50)
         
         try:
@@ -101,7 +101,7 @@ class ServidorUDP:
         ack_event_local = threading.Event()
         self.transferencias_ativas[addr] = (ack_event_local, ultimo_ack_recebido)
 
-        print(f"\n[GBN] Iniciando envio para {addr} | Arquivo: {nome_arquivo}")
+        print(f"\n[START] Iniciando envio para {addr} | Arquivo: {nome_arquivo}")
 
         try:
             with open(path, "rb") as f:
@@ -130,7 +130,7 @@ class ServidorUDP:
                                     janela_local.append(novo_p)
                                     # Envia APENAS o novo
                                     if random.random() < CHANCE_CORRUPCAO:
-                                        print(f"[!] Corrompendo propositalmente o pacote {s}")
+                                        print(f"[!] Corrompendo propositalmente o pacote {proxima_seq_leitura}")
                                         envio = self._corromper(novo_p)
                                     else:
                                         envio = novo_p
@@ -146,12 +146,7 @@ class ServidorUDP:
                         
                         for p in janela_local:
                             _, s, _, _, _ = desempacotar_pacote(p)
-                            if random.random() < CHANCE_CORRUPCAO:
-                                print(f"[!] Corrompendo propositalmente o pacote {s}")
-                                envio = self._corromper(p)
-                            else:
-                                envio = p
-                            self.sock.sendto(envio, addr)
+                            self.sock.sendto(p, addr)
                             print(f"[RESEND] Segmento {s} enviado")
 
                 if self.running:

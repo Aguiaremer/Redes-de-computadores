@@ -7,8 +7,8 @@ import zlib
 import random
 
 # --- CONFIGURAÇÕES ---
-TAMANHO_PAYLOAD = 1024
-CHANCE_PERDA = 0.001
+TAMANHO_PAYLOAD = 1400
+CHANCE_PERDA = 0.01
 FORMATO_HEADER = '!BIIH'
 TAMANHO_HEADER = struct.calcsize(FORMATO_HEADER)
 
@@ -38,17 +38,17 @@ class ClienteUDP:
 
     def fazer_handshake(self):
         print(f"[*] Iniciando Handshake com {self.addr_servidor}...")
-        for i in range(3):
-            try:
-                self.sock.sendto(criar_pacote(SYN, 0), self.addr_servidor)
-                dados, _ = self.sock.recvfrom(TAMANHO_PAYLOAD + TAMANHO_HEADER)
-                tipo, _, _, _, _ = desempacotar_pacote(dados)
-                if tipo == SYN_ACK:
-                    print("[+] Handshake OK! Conectado ao servidor.")
-                    self.autenticado = True
-                    return True
-            except socket.timeout:
-                print(f"[!] Sem resposta do servidor (Tentativa {i+1}/3)")
+        try:
+            self.sock.sendto(criar_pacote(SYN, 0), self.addr_servidor)
+            dados, _ = self.sock.recvfrom(TAMANHO_PAYLOAD + TAMANHO_HEADER)
+            tipo, _, _, _, _ = desempacotar_pacote(dados)
+            if tipo == SYN_ACK:
+                print("[+] Handshake OK! Conectado ao servidor.")
+                self.autenticado = True
+                return True
+                
+        except (socket.timeout, ConnectionResetError):
+            print("\n[ERRO] Nao foi possivel estabelecer conexao com o servidor.")
         return False
 
     def solicitar_arquivo(self, nome):
